@@ -1,0 +1,404 @@
+---
+title: "scRNA-seq analysis using Seurat package"
+output: html_notebook
+author: Long Nguyen
+---
+# Description:
+* The purpose of this notebook is to analyze scRNA-seq data of mouse Estrus
+* The method used is reading directly from mtx files (CellRanger count outputs)
+* The algorithms used come from Seurat package
+* Two mitochondiral genes: mt-Nd6 and mt-Cytb will be manually deleted
+* Because read_loom method in Scanpy does not contain those genes after filtering was done
+* The results will compared to:
+  + Same dataset analyzed using Scanpy - ManuallyRemoveGenes
+  + Same dataset analyzed using Scanpy - readloom
+  
+# Workflow begin
+This tutorial comes from [Seurat](https://satijalab.org/seurat/articles/pbmc3k_tutorial.html)
+
+## Load required packages
+```{r}
+library(dplyr)
+library(Seurat)
+library(leiden)
+library(ggplot2)
+library(patchwork)
+```
+
+
+## Load data
+Input is a directory that contains CellRanger count outputs
+```{r}
+previous_time <- proc.time()[3]
+Estrus.data <-Read10X(data.dir ="/home/nguyen/Estrus_cellranger_count/Estrus_Raw/")
+proc.time()[3] - previous_time
+```
+* View(Estrus.data) - run this command to investigate the output
+* Current dataset:
+  + 31253 genes
+  + 6599 cells
+
+## Initialize the Seurat object
+* Initialize the Seurat object with the raw (non-normalized data).
+* Filter out genes that are detected in less than 3 cells 
+* Filter out cells that have less than 200 genes expressed
+```{r}
+previous_time <- proc.time()[3]
+Estrus <- CreateSeuratObject(counts = Estrus.data, project = "Estrus", min.cells = 3, min.features = 200)
+proc.time()[3] - previous_time
+Estrus
+```
+* Output:
+  + 19420 genes 
+  + 6481 cells
+
+## Mitochondiral genes overview
+```{r}
+# This is the list of genes that start with mt
+mito_genes <- grep("^mt-", rownames(Estrus) , ignore.case=T, value=T)
+print(mito_genes)
+```
+
+## mt-Nd6 and mt-Cytb will be manually deleted
+```{r}
+counts <- GetAssayData(Estrus, assay = "RNA")
+counts <- counts[-(which(rownames(counts) %in% c("mt-Nd6", "mt-Cytb"))),]
+Estrus <- subset(Estrus, features = rownames(counts))
+```
+
+```{r}
+# This is the list of genes that start with mt
+mito_genes <- grep("^mt-", rownames(Estrus) , ignore.case=T, value=T)
+print(mito_genes)
+```
+* "mt-Nd6", "mt-Cytb" were deleted
+
+## Calculate the percentage of mitochondrial genes
+* Add "percent.mt" column to object metadata
+* Percentage of mitochondrial genes is stored in "percent.mt"
+* "^mt-" means strings start with mt (lowercase mt for mice, uppercase MT for human)
+```{r}
+Estrus[["percent.mt"]] <- PercentageFeatureSet(Estrus, pattern = "^mt-")
+```
+
+```{r}
+# This is the data in "percent.mt" column
+percent_mito <- FetchData(object = Estrus, vars = "percent.mt") #how to fetch data
+head(percent_mito)
+```
+
+```{r, fig.width=10}
+# Visualize QC metrics as a violin plot
+VlnPlot(Estrus, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+```{r}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+plot1 <- FeatureScatter(Estrus, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(Estrus, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+
+## Filter out low-quality cells
+* We filter out cells that have unique feature counts over 6000
+* Because any cell that has more than 6000 genes are likely doublets
+* Note: Seurat tutorial used 2500 instead of 6000
+* We also filter out cells that have more than 5% mitochondrial genes
+* Because those are likely to be nonviable cells
+```{r}
+previous_time <- proc.time()[3]
+Estrus <- subset(Estrus, subset = nFeature_RNA < 6000 & percent.mt < 5)
+proc.time()[3] - previous_time
+```
+```{r}
+Estrus
+```
+* After filtering step, the dataset is left with
+ + 19418 genes
+ + 2585 cells
+
+## Normalizing the data
+* Perform log-normalization method
+* Feature counts for each cell are divided by the total counts for that cell and multiplied by the scale.factor
+* scale.factor default value = 10,000
+* This is then natural-log transformed using log1p
+```{r}
+previous_time <- proc.time()[3]
+Estrus <- NormalizeData(Estrus, normalization.method = "LogNormalize", scale.factor = 10000)
+proc.time()[3] - previous_time
+```
+## Identification of highly variable features (feature selection)
+```{r}
+previous_time <- proc.time()[3]
+Estrus <- FindVariableFeatures(Estrus, selection.method = "disp", nfeatures = 5000)
+proc.time()[3] - previous_time
+```
+## Plotting highly variable features
+```{r}
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(Estrus), 10)
+top10
+```
+
+```{r, fig.width=10, fig.height=4}
+# Plot variable features with and without labels
+plot1 <- VariableFeaturePlot(Estrus)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2 
+```
+## Regress out data and perform scaling
+* Regressing out total counts per cell and percent.mt before scaling. 
+* Take out mitochondrial genes before scaling (analyzing) the data 
+* Because mito_genes shouldn't be accounted for cell population analysis.
+```{r}
+previous_time <- proc.time()[3]
+all.genes <- rownames(Estrus)
+Estrus <- ScaleData(Estrus, features = all.genes, vars.to.regress = c("nCount_RNA","percent.mt"), scale.max = 10)
+# Explanations below are from [Seurat](https://satijalab.org/seurat/archive/v3.0/cell_cycle_vignette.html)
+# vars.to.regress = RegressOut in Seurat version 1.4 or lower
+# However, as the results of this procedure are stored in the scaled data slot (therefore overwriting the output of ScaleData) 
+# This functionality is merged into the ScaleData function itself.
+proc.time()[3] - previous_time
+```
+## Perform linear dimensional reduction (PCA)
+```{r}
+previous_time <- proc.time()[3]
+Estrus <- RunPCA(Estrus, features = VariableFeatures(object = Estrus))
+proc.time()[3] - previous_time
+```
+
+## Examine and visualize PCA results a few different ways
+```{r}
+print(Estrus[["pca"]], dims = 1:5, nfeatures = 5)
+```
+
+```{r}
+VizDimLoadings(Estrus, dims = 1:2, reduction = "pca")
+```
+
+```{r}
+DimPlot(Estrus, reduction = "pca") + ggtitle(label = 'Including immune cells') 
+ggsave(filename = "PCA_Including_immune_cells.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+
+```{r, fig.width=12}
+FeaturePlot(Estrus, reduction = "pca", features = c('Ovgp1', 
+                                                    'Foxj1', 'Igf1', 'Pdxk', 
+                                                    'Fxyd4', 'Bsg', 
+                                                    'Serpina1e', 'Krt19'))
+ggsave(filename = "PCA_Including_immune_cells1.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+```{r, fig.width=12}
+FeaturePlot(Estrus, reduction = "pca", features = c('Dcn', 'Pax8',
+                                                    'Ephx2', 
+                                                    'Pecam1', 'Pdgfra', 'Myh11', 'Atp2b4', 
+                                                    'Cd52'))
+ggsave(filename = "PCA_Including_immune_cells2.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+
+## Determine the ‘dimensionality’ of the data
+* Seurat tutorial uses JackStraw() and and ScoreJackStraw to determine dimensionality
+* the syntax is: 
+  + Estrus <- JackStraw(Estrus, num.replicate = 100)
+  + Estrus <- ScoreJackStraw(Estrus, dims = 1:20)
+* However, it takes very long. 
+* An elbow plot often corresponds well enough with the significant dims and is much faster to run than Jackstraw
+* According to the graph below, choose the first 22 principle components to use
+```{r}
+ElbowPlot(Estrus, ndims = 40)
+```
+## Find neighbors
+* Dims = dimensions = determined as 22 from the above step
+```{r}
+previous_time <- proc.time()[3]
+Estrus_new <- FindNeighbors(Estrus, dims = 1:22, k.param = 10)
+proc.time()[3] - previous_time
+```
+## Find cell clusters using Leiden's method
+```{r}
+# Algorithm = 4 specifies Leiden's method
+previous_time <- proc.time()[3]
+Estrus_new <- FindClusters(Estrus_new, resolution = 0.14, algorithm = 4)
+proc.time()[3] - previous_time
+```
+## Constructing UMAP plot
+```{r}
+previous_time <- proc.time()[3]
+Estrus_new <- RunUMAP(Estrus_new, dim = 1:22) 
+proc.time()[3] - previous_time
+```
+## Visualization
+```{r}
+DimPlot(Estrus_new, reduction = "umap") + ggtitle(label = 'Including immune cells')
+ggsave(filename = "UMAP_Including_immune_cells.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+```{r, fig.width=12}
+FeaturePlot(Estrus_new, reduction = "umap", features = c('Ovgp1', 'Foxj1', 'Dcn', 'Serpina1e', 'Sprr2f',
+                                                         'Fxyd4', 'Ly6a', 'Epcam', 'Krt19', 'Vim', 'Pdgfra'))
+ggsave(filename = "UMAP_Including_immune_cells1.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+
+```{r, fig.width=12}
+FeaturePlot(Estrus_new, reduction = "umap", features = c('Myh11', 
+                                        'Dkk2', 'Slitrk6', 'Dio2', 'Smoc2', 'Tes', 'Dab1', 'Camk1d', 'Pecam1', 'Cd52','Mki67'))
+ggsave(filename = "UMAP_Including_immune_cells2.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+## Removing immune cells
+```{r, fig.width=12}
+sub_Estrus = subset(x = Estrus_new, ident = c(1,2,3,4,5,6,7,9,10,12))
+DimPlot(sub_Estrus, reduction = "umap") + ggtitle(label = 'Immune cells removed')
+ggsave(filename = "UMAP_Immune_cells_removed.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+```{r, fig.width=12}
+FeaturePlot(sub_Estrus, reduction = "umap", features = c('Ovgp1', 'Foxj1', 'Fxyd4', 'Cxcl17', 'Myh11', 'Cd52', 'Twist2', 'Pecam1'))
+ggsave(filename = "UMAP_Immune_cells_removed1.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+```{r, fig.width=12}
+FeaturePlot(sub_Estrus, reduction = "umap", features = c('Pdgfra', 'Ephx2', 'Dcn', 'Krt19', 'Epcam', 'Vim','Mki67'))
+ggsave(filename = "UMAP_Immune_cells_removed2.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+```{r}
+sub_Estrus
+```
+* After removing immune cells, the dataset is left with:
+  + 19418 genes
+  + 2318 cells
+
+## Re-run analysis after excluding immune cells
+```{r}
+previous_time <- proc.time()[3]
+sub_Estrus <- RunPCA(sub_Estrus, features = VariableFeatures(object = sub_Estrus))
+proc.time()[3] - previous_time
+```
+
+```{r, fig.width=12}
+DimPlot(sub_Estrus, reduction = "pca") + ggtitle(label = 'Immune cells removed')
+ggsave(filename = "PCA_Immune_cells_removed.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+
+```{r, fig.width=12}
+FeaturePlot(sub_Estrus, reduction = "pca", features = c('Esr1', 'Ovgp1', 'Foxj1', 'Fxyd4', 'Ephx2', 'Dcn'))
+ggsave(filename = "PCA_Immune_cells_removed1.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+
+```{r, fig.width=12}
+FeaturePlot(sub_Estrus, reduction = "pca", features = c('Fos', 'Kcne3', 'Serpina1e', 'Crabp2', 'Pgr', 'Vim'))
+ggsave(filename = "PCA_Immune_cells_removed2.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+```{r}
+previous_time <- proc.time()[3]
+sub_Estrus_new <- FindNeighbors(sub_Estrus, dims = 1:22)
+proc.time()[3] - previous_time
+```
+
+```{r}
+previous_time <- proc.time()[3]
+sub_Estrus_new <- FindClusters(sub_Estrus_new, resolution = 0.04, algorithm = 4)
+proc.time()[3] - previous_time
+```
+
+```{r}
+previous_time <- proc.time()[3]
+sub_Estrus_new <- RunUMAP(sub_Estrus_new, dim = 1:22)
+proc.time()[3] - previous_time
+```
+
+```{r, fig.width=10}
+DimPlot(sub_Estrus_new, reduction = "umap") + ggtitle(label = 'Rescale UMAP after removing Immune cells')
+ggsave(filename = "UMAP_Rescale.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+```{r, fig.width=12}
+FeaturePlot(sub_Estrus_new, reduction = "umap", features = c('Ovgp1', 'Foxj1', 'Crabp2', 'Myh11', 'Wt1', 'S100g', 'Sprr2f',
+                  'Fxyd4'))
+ggsave(filename = "UMAP_Rescale1.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+
+```{r, fig.width=12}
+FeaturePlot(sub_Estrus_new, reduction = "umap", features = c('Dcn', 'Pax8', 'Pax2', 'Twist2', 'Igf1', 'Serpina1e', 'Pdgfra', 'Krt19', 'Mki67'))
+ggsave(filename = "UMAP_Rescale2.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+## Marker genes
+```{r}
+marker_genes = c('Epcam', 'Krt15','Krt8','Krt19','Vim','Pdgfra','Twist2', 'Sprr2f', 'Fxyd4', 'Igfbp6',
+                 'Acta2', 'Myh11','Foxj1','Ovgp1','Wt1','Serpina1e','S100g','Pecam1')
+```
+
+## UMAP for marker genes
+```{r, fig.width=12}
+FeaturePlot(sub_Estrus_new, reduction = "umap", features = c('Epcam', 'Krt15','Krt8','Krt19','Vim','Pdgfra','Twist2', 'Sprr2f', 'Fxyd4'))
+ggsave(filename = "UMAP_for_Marker_genes1.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+
+```{r, fig.width=12}
+FeaturePlot(sub_Estrus_new, reduction = "umap", features = c('Igfbp6',
+                                                             'Acta2', 'Myh11','Foxj1','Ovgp1','Wt1','Serpina1e','S100g','Pecam1'))
+ggsave(filename = "UMAP_for_Marker_genes2.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+
+## Rename clusters
+```{r}
+Cluster.names <- c('1 Ciliated_InfAmp',
+                   '2 Secretory_InfAmp',
+                   '3 Epithelial_subset',
+                   '4 Fibroblast Pdgfra+',
+                   '5 Secretory_IsthUTJ',
+                   '6 Fibroblast Pdgfra-',
+                   '7 Muscle')
+names(Cluster.names) <- levels(sub_Estrus_new)
+sub_Estrus_new <- RenameIdents(sub_Estrus_new, Cluster.names)
+DimPlot(sub_Estrus_new, reduction = "umap", pt.size = 0.5) + scale_color_manual(labels = Cluster.names,values=c('green',                                                                                        'red','blue','orange','grey','yellow','pink','purple'))
+ggsave(filename = "UMAP_Clusters_names.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+```{r, fig.width=12}
+DotPlot(sub_Estrus_new, features = marker_genes, group.by = sub_Estrus_new@meta.data$ident) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  scale_y_discrete(labels = Cluster.names)
+ggsave(filename = "DotPlot_for_Marker_genes.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+## Number of cells in each clusters
+```{r}
+table(sub_Estrus_new@active.ident, sub_Estrus_new@meta.data$orig.ident)
+```
+
+## Extract top genes for each cluster
+* Default method of finding highly expressed genes for FindAllMarkers is Wilcoxon Rank Sum test
+```{r}
+previous_time <- proc.time()[3]
+sub_Estrus_new_markers <- FindAllMarkers(sub_Estrus_new, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+sub_Estrus_new_markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 20, order_by = avg_log2FC)
+proc.time()[3] - previous_time
+```
+## Heat map for top 10 genes in each cluster
+```{r, fig.width=10}
+sub_Estrus_new_markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+DoHeatmap(sub_Estrus_new, features = top10$gene) + NoLegend()
+ggsave(filename = "HeatMap_Top10_genes.pdf", plot = last_plot(), device = "pdf",
+         path = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Figures/")
+```
+```{r}
+saveRDS(sub_Estrus_new, file = "/home/nguyen/FinalWork/R/ManuallyRemoveGenes/Estrus_subset_analyzed.rds")
+```
+
